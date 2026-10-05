@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvc-xfer</title>
+<meta name="description" content="How paged KV-cache blocks move from a prefill worker to a decode worker, one layer range at a time.">
+<link rel="icon" href="icon.svg" type="image/svg+xml" sizes="any">
+<style>
+  @font-face {
+    font-family: "Excalifont";
+    src: url("fonts/Excalifont-Regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root {
+    --paper: #f4f3ef;
+    --ink: #1c1c1c;
+    --muted: #5e5e5a;
+    --faint: #8a8a84;
+    --line: #d9d7d0;
+    --wash: #e7e5df;
+    --card: #fbfaf7;
+    --accent: #a33d2a;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Excalifont, "Segoe Print", "Comic Sans MS", ui-rounded, sans-serif;
+    font-size: 19px;
+    line-height: 1.45;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .cell { transition: none; }
+    #ready { transition: none; }
+  }
+  a { color: inherit; }
+  code { font-family: inherit; font-size: 0.92em; }
+  h1, h2, h3 { text-wrap: balance; font-weight: 400; }
+  p { text-wrap: pretty; }
+  .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 28px 0 0;
+    font-size: 16px;
+  }
+  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
+  header a:hover, header a:focus-visible { color: var(--ink); }
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(280px, 0.95fr);
+    gap: 12px 28px;
+    align-items: center;
+    padding: 36px 0 8px;
+  }
+  .kicker { margin: 0; color: var(--muted); font-size: 16px; }
+  h1 { font-size: clamp(34px, 4.6vw, 52px); line-height: 1.05; margin: 8px 0 14px; }
+  .lede { margin: 0; max-width: 34em; }
+  .sketch { margin: 0; }
+  .sketch svg, .figure svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .sketch figcaption, .caption { margin: 8px 0 0; color: var(--muted); font-size: 15px; max-width: 46em; }
+  .sketch figcaption { min-height: 4.8em; }
+  #play {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    margin: 0 8px 0 0;
+    font: inherit;
+    font-size: 15px;
+    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+    cursor: pointer;
+  }
+  #play:hover { color: var(--accent); }
+  #play:focus-visible, header a:focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 3px;
+  }
+  .stats {
+    list-style: none; margin: 22px 0 0; padding: 0;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  }
+  .stats li { margin: 0; color: var(--muted); }
+  .stats b { display: block; color: var(--ink); font-weight: 400; }
+  .stats em { font-style: normal; color: var(--accent); }
+  section { padding: 52px 0 4px; }
+  h2 { font-size: 28px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 18px; max-width: 40em; }
+  .figure { margin: 0 0 8px; }
+  .prose { margin: 0; max-width: 40em; }
+  .cell { fill: var(--card); stroke: var(--ink); stroke-width: 1.6; stroke-linejoin: round; transition: fill 160ms ease-out; }
+  .cell[data-state="hot"] { fill: var(--wash); }
+  .cell[data-state="full"] { fill: var(--ink); }
+  svg text { font-family: Excalifont, ui-rounded, sans-serif; }
+  #ready { transition: opacity 180ms ease-out; }
+  table { width: 100%; max-width: 36em; border-collapse: collapse; font-size: 17px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 8px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 400; }
+  td.num, th.num { text-align: right; padding-right: 0; }
+  footer { padding: 36px 0 56px; color: var(--muted); font-size: 15px; }
+  footer a { color: var(--ink); }
+  @media (max-width: 800px) {
+    .hero, .stats { grid-template-columns: 1fr; }
+    header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    header nav { margin-left: -18px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span>kvc-xfer</span>
+    <nav>
+      <a href="#handoff">Handoff</a>
+      <a href="#copies">Copies</a>
+      <a href="#wire">Wire</a>
+      <a href="#numbers">Numbers</a>
+    </nav>
+  </header>
+
+  <div class="hero" id="handoff">
+    <div>
+      <p class="kicker">KV-cache blocks, from the prefill worker to the decode worker</p>
+      <h1>The first layers leave before the last ones exist.</h1>
+      <p class="lede">kvc-xfer moves paged KV cache between inference nodes. Decode names the destination blocks. Prefill pushes each finished layer range as a coalesced copy, and READY means those bytes have landed.</p>
+    </div>
+    <figure class="sketch">
+      <svg viewBox="0 0 620 246" role="img" aria-labelledby="hero-title hero-desc">
+        <title id="hero-title">Layer ranges moving from prefill to decode</title>
+        <desc id="hero-desc">Decode reserves blocks 17, 18, and 19 and sends PREPARE. Prefill pushes layers in four ranges: [0, 8), [8, 16), [16, 24), and [24, 32). Each range is one coalesced copy across the three blocks. The next range starts computing while the previous range is in flight. READY follows the last byte, and decode starts when every range has landed.</desc>
+        <defs>
+          <marker id="ah-prep" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto">
+            <path d="M1 1 L11 6 L1 11" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"/>
+          </marker>
+        </defs>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M72 32 h150 v172 h-150 z"/>
+          <path d="M434 30 h150 v174 h-150 z"/>
+        </g>
+        <g class="cells">
+          <path class="cell" data-side="pf" data-row="0" data-state="empty" d="M84 43 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="0" data-state="empty" d="M128 42 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="0" data-state="empty" d="M172 44 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="1" data-state="empty" d="M84 81 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="1" data-state="empty" d="M128 80 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="1" data-state="empty" d="M172 82 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="2" data-state="empty" d="M84 119 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="2" data-state="empty" d="M128 118 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="2" data-state="empty" d="M172 120 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="3" data-state="empty" d="M84 157 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="3" data-state="empty" d="M128 156 h38 v30 h-38 z"/>
+          <path class="cell" data-side="pf" data-row="3" data-state="empty" d="M172 158 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="0" data-state="empty" d="M446 43 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="0" data-state="empty" d="M490 42 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="0" data-state="empty" d="M534 44 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="1" data-state="empty" d="M446 81 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="1" data-state="empty" d="M490 80 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="1" data-state="empty" d="M534 82 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="2" data-state="empty" d="M446 119 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="2" data-state="empty" d="M490 118 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="2" data-state="empty" d="M534 120 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="3" data-state="empty" d="M446 157 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="3" data-state="empty" d="M490 156 h38 v30 h-38 z"/>
+          <path class="cell" data-side="dc" data-row="3" data-state="empty" d="M534 158 h38 v30 h-38 z"/>
+        </g>
+        <g id="prep" opacity="0" fill="#1c1c1c">
+          <path d="M400 118 H250" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah-prep)"/>
+          <text x="325" y="108" text-anchor="middle" font-size="14">PREPARE</text>
+        </g>
+        <g id="pkt" opacity="0">
+          <path d="M0 1 h68 v28 h-68 z" fill="#fbfaf7" stroke="#a33d2a" stroke-width="1.8" stroke-linejoin="round"/>
+          <text id="pkt-label" x="34" y="20" text-anchor="middle" font-size="13" fill="#a33d2a">[0, 8)</text>
+        </g>
+        <g fill="#1c1c1c">
+          <text x="72" y="22" font-size="16">prefill</text>
+          <text x="434" y="20" font-size="16">decode</text>
+          <text id="ready" x="512" y="20" font-size="15" fill="#a33d2a" opacity="0">READY</text>
+          <text x="103" y="224" text-anchor="middle" font-size="14">0</text>
+          <text x="147" y="224" text-anchor="middle" font-size="14">1</text>
+          <text x="191" y="224" text-anchor="middle" font-size="14">2</text>
+          <text x="465" y="224" text-anchor="middle" font-size="14">17</text>
+          <text x="509" y="224" text-anchor="middle" font-size="14">18</text>
+          <text x="553" y="224" text-anchor="middle" font-size="14">19</text>
+        </g>
+        <g fill="#5e5e5a" font-size="13">
+          <text x="0" y="63">[0, 8)</text>
+          <text x="0" y="101">[8, 16)</text>
+          <text x="0" y="139">[16, 24)</text>
+          <text x="0" y="177">[24, 32)</text>
+        </g>
+      </svg>
+      <figcaption><button type="button" id="play">Pause</button> <span id="cap">Blocks 17–19 are reserved. No layer is finished.</span></figcaption>
+    </figure>
+  </div>
+
+  <ul class="stats">
+    <li><b><em>[0, 8)</em> while [8, 16)</b>the next range is still computing</li>
+    <li><b><em>2</em> per layer</b>descriptors for a contiguous run</li>
+    <li><b>~1.4 GiB/s</b>loopback TCP, 128 MiB</li>
+  </ul>
+
+  <section id="copies">
+    <h2>Adjacent blocks become one copy.</h2>
+    <p class="sub"><code>build_block_descriptors</code> emits one slice per block, per layer, per K or V. <code>coalesce_descriptors</code> merges a slice into the previous one only when the bytes abut in the source region and in the destination region.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 840 348" role="img" aria-labelledby="copy-title copy-desc">
+        <title id="copy-title">Contiguous blocks collapsing into fewer descriptors</title>
+        <desc id="copy-desc">On a layer-major cache, the K slices of blocks 0, 1, and 2 become one descriptor, and the V slices become another. On a block-major cache the same three blocks become a single descriptor. A gap on either side keeps the copies separate.</desc>
+        <defs>
+          <marker id="ah-copy" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto">
+            <path d="M1 1 L11 6 L1 11" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"/>
+          </marker>
+        </defs>
+        <g fill="#1c1c1c" font-size="15">
+          <text x="24" y="28">layer-major, one layer</text>
+          <text x="48" y="52" text-anchor="middle">0</text>
+          <text x="110" y="52" text-anchor="middle">1</text>
+          <text x="172" y="52" text-anchor="middle">2</text>
+        </g>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M24 62 h48 v40 h-48 z"/>
+          <path d="M86 60 h48 v40 h-48 z"/>
+          <path d="M148 63 h48 v40 h-48 z"/>
+          <path d="M24 114 h48 v40 h-48 z"/>
+          <path d="M86 112 h48 v40 h-48 z"/>
+          <path d="M148 115 h48 v40 h-48 z"/>
+        </g>
+        <g fill="#1c1c1c" font-size="16">
+          <text x="40" y="87">K</text>
+          <text x="102" y="85">K</text>
+          <text x="164" y="88">K</text>
+          <text x="40" y="139">V</text>
+          <text x="102" y="137">V</text>
+          <text x="164" y="140">V</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round">
+          <path d="M214 108 H268" marker-end="url(#ah-copy)"/>
+        </g>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M286 60 h250 v42 h-250 z"/>
+          <path d="M286 114 h250 v42 h-250 z"/>
+        </g>
+        <g fill="#1c1c1c" font-size="16">
+          <text x="304" y="86">K, one descriptor</text>
+          <text x="304" y="140">V, one descriptor</text>
+        </g>
+        <text x="286" y="184" fill="#5e5e5a" font-size="15">two per layer, at any block count</text>
+        <path d="M24 210 h790" fill="none" stroke="#d9d7d0" stroke-width="1.4"/>
+        <text x="24" y="246" fill="#1c1c1c" font-size="15">block-major, all layers</text>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M24 264 h48 v58 h-48 z"/>
+          <path d="M86 262 h48 v58 h-48 z"/>
+          <path d="M148 265 h48 v58 h-48 z"/>
+          <path d="M286 262 h360 v60 h-360 z"/>
+        </g>
+        <g fill="#1c1c1c" font-size="16">
+          <text x="42" y="298">0</text>
+          <text x="104" y="296">1</text>
+          <text x="166" y="299">2</text>
+          <text x="304" y="298">one descriptor</text>
+        </g>
+        <path d="M214 292 H268" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" marker-end="url(#ah-copy)"/>
+      </svg>
+      <figcaption>Blocks 0–2 onto an equally contiguous run. A hole on either side, source or destination, leaves the copies separate. Layer-major talking to block-major does not merge either: the bytes abut on only one side.</figcaption>
+    </figure>
+  </section>
+
+  <section id="wire">
+    <h2>The payload is not copied onto the wire.</h2>
+    <p class="sub">The sender thread builds an iovec that points at the registered region and calls <code>sendmsg</code>. The only bytes allocated for the transfer are the 24-byte frame header. The peer’s reader <code>recv</code>s each chunk straight into the destination region.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 860 210" role="img" aria-labelledby="wire-title wire-desc">
+        <title id="wire-title">A write frame beside the regions it joins</title>
+        <desc id="wire-desc">A source region connects to a 24-byte header and a payload that is still the source memory. That payload is received directly into the destination region. WRITE_ACK returns after the bytes have landed.</desc>
+        <defs>
+          <marker id="ah-wire" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto">
+            <path d="M1 1 L11 6 L1 11" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"/>
+          </marker>
+        </defs>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linejoin="round">
+          <path d="M16 58 h132 v78 h-132 z"/>
+          <path d="M196 56 h78 v80 h-78 z"/>
+          <path d="M280 58 h70 v80 h-70 z"/>
+          <path d="M356 57 h78 v80 h-78 z"/>
+          <path d="M440 58 h250 v80 h-250 z"/>
+          <path d="M740 56 h104 v80 h-104 z"/>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round">
+          <path d="M156 96 H196" marker-end="url(#ah-wire)"/>
+          <path d="M698 98 H740" marker-end="url(#ah-wire)"/>
+        </g>
+        <g fill="#1c1c1c" font-size="15">
+          <text x="34" y="92">source</text>
+          <text x="34" y="114">region</text>
+          <text x="214" y="102">KVC1</text>
+          <text x="298" y="104">type</text>
+          <text x="382" y="103">id</text>
+          <text x="458" y="94">payload</text>
+          <text x="458" y="116" fill="#5e5e5a">still the source bytes</text>
+          <text x="756" y="92">dest</text>
+          <text x="756" y="114">region</text>
+        </g>
+        <text x="196" y="166" fill="#5e5e5a" font-size="15">header, 24 bytes, the part that is actually allocated</text>
+        <path d="M196 146 H434" fill="none" stroke="#5e5e5a" stroke-width="1.3"/>
+        <path d="M196 146 v6 M434 146 v6" fill="none" stroke="#5e5e5a" stroke-width="1.3"/>
+      </svg>
+      <figcaption>A write completes when <code>WRITE_ACK</code> comes back, which is after the remote has landed the bytes. <code>notify()</code> stays behind earlier writes on that connection, so READY cannot overtake the range it is announcing.</figcaption>
+    </figure>
+  </section>
+
+  <section id="order">
+    <h2>Either call can arrive first.</h2>
+    <p class="prose"><code>expect()</code> sends PREPARE and waits. <code>publish()</code> before that PREPARE shows up is queued, and it runs when the blocks arrive. The usual order is the other way around: decode has already called <code>expect()</code> by the time a layer range finishes. The layout fingerprint rides along in PREPARE, and a mismatch fails before any bytes move. <code>abort()</code> from either side drops the request, and the in-flight handles complete with Cancelled.</p>
+  </section>
+
+  <section id="numbers">
+    <h2>Loopback is the ceiling.</h2>
+    <p class="sub">Apple M-series, one connection, 128&nbsp;MiB per transfer. The TCP rows are the kernel socket path. <code>LocalTransport</code> is the same engine over <code>memcpy</code>, which is what two workers in one process get.</p>
+    <table>
+      <caption class="caption" style="caption-side: bottom">Push and pull take the same path. A real NIC wants a connection per queue, or a transport that is not TCP.</caption>
+      <thead>
+        <tr><th>Transport</th><th class="num">Throughput</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>tcp, push, layer-major</td><td class="num">~1.4 GiB/s</td></tr>
+        <tr><td>tcp, pull</td><td class="num">~1.4 GiB/s</td></tr>
+        <tr><td>local memcpy, push</td><td class="num">~44 GiB/s</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p>C++20. The standard library and POSIX sockets. The suite is clean under ASan, UBSan, and TSan. <a href="https://github.com/jvkec/kvc-xfer">Source</a>.</p>
+  </footer>
+</div>
+<script>
+const phases = [
+  { ms: 1300, cap: "Blocks 17–19 are reserved. No layer is finished.",
+    pf: [0, 0, 0, 0], dc: [0, 0, 0, 0], fly: -1, prep: 0, ready: 0 },
+  { ms: 1500, cap: "PREPARE names the blocks, the range, and the layout fingerprint.",
+    pf: [0, 0, 0, 0], dc: [0, 0, 0, 0], fly: -1, prep: 1, ready: 0 },
+  { ms: 1200, cap: "Layers [0, 8) are done. The rest do not exist yet.",
+    pf: [2, 0, 0, 0], dc: [0, 0, 0, 0], fly: -1, prep: 0, ready: 0 },
+  { ms: 1700, cap: "One copy per K and per V. Layers [8, 16) are already computing.",
+    pf: [2, 1, 0, 0], dc: [0, 0, 0, 0], fly: 0, prep: 0, ready: 0 },
+  { ms: 1700, cap: "[0, 8) has landed. [8, 16) is on the wire.",
+    pf: [2, 2, 1, 0], dc: [2, 0, 0, 0], fly: 1, prep: 0, ready: 0 },
+  { ms: 1700, cap: "[16, 24) crosses while the last range is still computing.",
+    pf: [2, 2, 2, 1], dc: [2, 2, 0, 0], fly: 2, prep: 0, ready: 0 },
+  { ms: 1700, cap: "The last range follows. READY cannot leave before it.",
+    pf: [2, 2, 2, 2], dc: [2, 2, 2, 0], fly: 3, prep: 0, ready: 0 },
+  { ms: 2200, cap: "Every expected layer has landed. Decode can start this request.",
+    pf: [2, 2, 2, 2], dc: [2, 2, 2, 2], fly: -1, prep: 0, ready: 1 }
+];
+const total = phases.reduce((sum, p) => sum + p.ms, 0);
+const rowY = [42, 80, 118, 156];
+const tags = ["[0, 8)", "[8, 16)", "[16, 24)", "[24, 32)"];
+const x0 = 226;
+const x1 = 358;
+const names = ["empty", "hot", "full"];
+const cells = { pf: [[], [], [], []], dc: [[], [], [], []] };
+document.querySelectorAll(".cell").forEach((el) => {
+  cells[el.dataset.side][Number(el.dataset.row)].push(el);
+});
+const cap = document.getElementById("cap");
+const pkt = document.getElementById("pkt");
+const pktLabel = document.getElementById("pkt-label");
+const prep = document.getElementById("prep");
+const ready = document.getElementById("ready");
+const play = document.getElementById("play");
+const reduce = matchMedia("(prefers-reduced-motion: reduce)");
+const figure = document.querySelector(".sketch");
+
+let elapsed = 0;
+let playing = !reduce.matches;
+let onScreen = true;
+let raf = 0;
+let epoch = 0;
+
+function setRow(side, row, state) {
+  const name = names[state];
+  for (const el of cells[side][row]) {
+    if (el.dataset.state !== name) el.dataset.state = name;
+  }
+}
+function draw(p, u) {
+  for (let r = 0; r < 4; r++) {
+    const landed = p.fly === r && u > 0.9;
+    setRow("pf", r, p.pf[r]);
+    setRow("dc", r, landed ? 2 : p.dc[r]);
+  }
+  if (cap.textContent !== p.cap) cap.textContent = p.cap;
+  if (p.fly >= 0 && u <= 0.9) {
+    pkt.style.opacity = "1";
+    if (pktLabel.textContent !== tags[p.fly]) pktLabel.textContent = tags[p.fly];
+    pkt.style.transform = `translate(${x0 + (x1 - x0) * u}px, ${rowY[p.fly]}px)`;
+  } else {
+    pkt.style.opacity = "0";
+  }
+  if (p.prep) {
+    prep.style.opacity = "1";
+    prep.style.transform = `translateX(${(1 - u) * 42}px)`;
+  } else {
+    prep.style.opacity = "0";
+  }
+  ready.style.opacity = p.ready ? "1" : "0";
+}
+function renderAt(ms) {
+  let t = ms % total;
+  let i = 0;
+  while (i < phases.length && t >= phases[i].ms) {
+    t -= phases[i].ms;
+    i++;
+  }
+  if (i >= phases.length) {
+    i = 0;
+    t = 0;
+  }
+  draw(phases[i], t / phases[i].ms);
+}
+function frame(now) {
+  if (!playing || !onScreen) return;
+  elapsed += now - epoch;
+  epoch = now;
+  renderAt(elapsed);
+  raf = requestAnimationFrame(frame);
+}
+function start() {
+  if (raf) cancelAnimationFrame(raf);
+  epoch = performance.now();
+  raf = requestAnimationFrame(frame);
+}
+function stop() {
+  if (raf) cancelAnimationFrame(raf);
+  raf = 0;
+}
+function syncButton() {
+  play.textContent = playing ? "Pause" : "Play";
+  play.setAttribute("aria-label", playing ? "Pause the handoff" : "Play the handoff");
+}
+play.addEventListener("click", () => {
+  playing = !playing;
+  syncButton();
+  if (playing && onScreen) start();
+  else stop();
+});
+new IntersectionObserver((entries) => {
+  onScreen = entries[0].isIntersecting;
+  if (onScreen && playing) start();
+  else stop();
+}, { threshold: 0.2 }).observe(figure);
+
+if (reduce.matches) {
+  elapsed = phases[0].ms + phases[1].ms + phases[2].ms + phases[3].ms + phases[4].ms * 0.45;
+  renderAt(elapsed);
+} else {
+  renderAt(0);
+  start();
+}
+syncButton();
+reduce.addEventListener("change", () => {
+  if (reduce.matches) {
+    playing = false;
+    stop();
+    elapsed = phases[0].ms + phases[1].ms + phases[2].ms + phases[3].ms + phases[4].ms * 0.45;
+    renderAt(elapsed);
+  }
+  syncButton();
+});
+</script>
+</body>
+</html>
