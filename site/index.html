@@ -46,12 +46,9 @@
   p { text-wrap: pretty; }
   .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
   header {
-    display: flex; justify-content: space-between; align-items: baseline;
     padding: 28px 0 0;
     font-size: 16px;
   }
-  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
-  header a:hover, header a:focus-visible { color: var(--ink); }
   .hero {
     display: grid;
     grid-template-columns: minmax(0, 1.05fr) minmax(280px, 0.95fr);
@@ -81,7 +78,7 @@
     cursor: pointer;
   }
   #play:hover { color: var(--accent); }
-  #play:focus-visible, header a:focus-visible {
+  #play:focus-visible {
     outline: 2px solid var(--ink);
     outline-offset: 3px;
   }
@@ -110,8 +107,6 @@
   footer a { color: var(--ink); }
   @media (max-width: 800px) {
     .hero, .stats { grid-template-columns: 1fr; }
-    header { flex-direction: column; align-items: flex-start; gap: 8px; }
-    header nav { margin-left: -18px; }
   }
 </style>
 </head>
@@ -119,12 +114,6 @@
 <div class="wrap">
   <header>
     <span>kvc-xfer</span>
-    <nav>
-      <a href="#handoff">Handoff</a>
-      <a href="#copies">Copies</a>
-      <a href="#wire">Wire</a>
-      <a href="#numbers">Numbers</a>
-    </nav>
   </header>
 
   <div class="hero" id="handoff">
