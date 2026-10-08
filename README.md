@@ -6,9 +6,9 @@ same machine). It is a C++20 library with no dependencies beyond the standard
 library and POSIX sockets.
 
 The handoff, with each layer range crossing while the next one is still
-computing, is at <https://jvkec.github.io/kvc-xfer/>.
+computing, is at <https://johnkimec.github.io/kvc-xfer/>.
 
-[![kvc-xfer site](site/preview.png)](https://jvkec.github.io/kvc-xfer/)
+[![kvc-xfer site](site/preview.png)](https://johnkimec.github.io/kvc-xfer/)
 
 ```
  prefill node                                        decode node
